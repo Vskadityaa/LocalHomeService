@@ -4,7 +4,7 @@ import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getAnalytics } from "firebase/analytics";
 import { getStorage } from "firebase/storage"; // ✅ Add this
-
+import { getDatabase } from "firebase/database";
 const firebaseConfig = {
   apiKey: "AIzaSyCS6Acs1e03DOXUlhk3WW7W6U8JIqeBZ5Q",
   authDomain: "localservice-467aa.firebaseapp.com",
@@ -20,5 +20,5 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const storage = getStorage(app); // ✅ Only define once
 const analytics = getAnalytics(app); // optional
-
+export const rtdb = getDatabase(app);
 export { app, auth, db, storage }; // ✅ Clean export

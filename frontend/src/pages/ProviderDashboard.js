@@ -10,7 +10,14 @@ import {
   getDoc,
   setDoc,
 } from 'firebase/firestore';
-import { signOut } from 'firebase/auth';
+import { signOut, onAuthStateChanged } from 'firebase/auth';
+import {
+  getDatabase,
+  ref as rtdbRef,
+  set as rtdbSet,
+  onDisconnect,
+  onValue,
+} from 'firebase/database';
 import { useNavigate } from 'react-router-dom';
 import './ProviderDashboard.css';
 
@@ -19,29 +26,64 @@ const ProviderDashboard = () => {
   const [services, setServices] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [providerInfo, setProviderInfo] = useState({});
+  const [currentUser, setCurrentUser] = useState(null);
+  const [isOnline, setIsOnline] = useState(false);
+  const [lastSeen, setLastSeen] = useState(null);
+
   const navigate = useNavigate();
-  const currentUser = auth.currentUser;
 
   useEffect(() => {
-    if (currentUser) {
-      fetchProviderData();
-    }
-  }, [currentUser]);
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setCurrentUser(user);
+        setProviderOnlineStatus(user.uid);
+        fetchProviderData(user.uid);
 
-  const fetchProviderData = async () => {
+        const dbRealtime = getDatabase();
+        const statusRef = rtdbRef(dbRealtime, `/status/${user.uid}`);
+        onValue(statusRef, (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            setIsOnline(data.online);
+            setLastSeen(data.lastSeen);
+          }
+        });
+      } else {
+        navigate('/auth');
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const setProviderOnlineStatus = (uid) => {
+    const dbRealtime = getDatabase();
+    const statusRef = rtdbRef(dbRealtime, `/status/${uid}`);
+
+    rtdbSet(statusRef, {
+      online: true,
+      lastSeen: Date.now(),
+    });
+
+    onDisconnect(statusRef).set({
+      online: false,
+      lastSeen: Date.now(),
+    });
+  };
+
+  const fetchProviderData = async (uid) => {
     const bookingsRef = collection(db, 'bookings');
     const servicesRef = collection(db, 'services');
-    const providerDocRef = doc(db, 'providers', currentUser.uid);
+    const providerDocRef = doc(db, 'providers', uid);
 
     const bookingsSnapshot = await getDocs(
-      query(bookingsRef, where('providerId', '==', currentUser.uid))
+      query(bookingsRef, where('providerId', '==', uid))
     );
     const servicesSnapshot = await getDocs(
-      query(servicesRef, where('providerId', '==', currentUser.uid))
+      query(servicesRef, where('providerId', '==', uid))
     );
 
-    setBookings(bookingsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    setServices(servicesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    setBookings(bookingsSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })));
+    setServices(servicesSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })));
 
     const providerDoc = await getDoc(providerDocRef);
     if (providerDoc.exists()) {
@@ -52,17 +94,25 @@ const ProviderDashboard = () => {
   };
 
   const handleLogout = async () => {
+    if (currentUser) {
+      const dbRealtime = getDatabase();
+      const statusRef = rtdbRef(dbRealtime, `/status/${currentUser.uid}`);
+      await rtdbSet(statusRef, {
+        online: false,
+        lastSeen: Date.now(),
+      });
+    }
     await signOut(auth);
     navigate('/auth');
   };
 
-  const confirmBooking = async bookingId => {
+  const confirmBooking = async (bookingId) => {
     await updateDoc(doc(db, 'bookings', bookingId), { status: 'Approved' });
-    fetchProviderData();
+    fetchProviderData(currentUser.uid);
   };
 
   const totalEarnings = bookings
-    .filter(b => b.status === 'Completed' && b.paymentReleased)
+    .filter((b) => b.status === 'Completed' && b.paymentReleased)
     .reduce((sum, b) => sum + Number(b.price || 0), 0);
 
   return (
@@ -72,6 +122,14 @@ const ProviderDashboard = () => {
         <h2>Service Provider</h2>
         <p><strong>Name:</strong> {providerInfo?.name || 'N/A'}</p>
         <p><strong>Email:</strong> {currentUser?.email}</p>
+        <p>
+          <strong>Status:</strong>{' '}
+          {isOnline
+            ? '🟢 Online'
+            : `🔴 Offline (Last seen: ${
+                lastSeen ? new Date(lastSeen).toLocaleString() : 'N/A'
+              })`}
+        </p>
 
         <ul className="sidebar-links">
           <li onClick={() => navigate('/ProviderDashboard')}>Dashboard</li>
@@ -82,7 +140,9 @@ const ProviderDashboard = () => {
 
       {/* Main Content */}
       <div className="main-content">
-        <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>&#9776;</button>
+        <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>
+          &#9776;
+        </button>
         <h1>Welcome, {providerInfo?.name || 'Provider'}</h1>
 
         <div className="stats">
@@ -96,7 +156,7 @@ const ProviderDashboard = () => {
         <div className="bookings-section">
           <h2>Recent Client Bookings</h2>
           {bookings.length === 0 && <p>No bookings yet.</p>}
-          {bookings.map(booking => (
+          {bookings.map((booking) => (
             <div key={booking.id} className="booking-card">
               <p><strong>Client:</strong> {booking.clientName}</p>
               <p><strong>Service:</strong> {booking.serviceType}</p>

@@ -2,34 +2,56 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { collection, getDocs, query, where } from 'firebase/firestore';
-import { signOut } from 'firebase/auth';
+import { signOut, onAuthStateChanged } from 'firebase/auth';
+import { getDatabase, ref, onValue } from 'firebase/database';
 
 const ClientDashboard = () => {
   const [providers, setProviders] = useState([]);
   const [client, setClient] = useState(null);
   const [bookings, setBookings] = useState([]);
   const [showSidebar, setShowSidebar] = useState(false);
+  const [providerStatuses, setProviderStatuses] = useState({});
   const navigate = useNavigate();
 
   useEffect(() => {
-    const fetchData = async () => {
-      const user = auth.currentUser;
-      if (!user) return navigate('/auth');
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        navigate('/auth'); // go to login only if NOT logged in
+        return;
+      }
 
+      // Get logged-in client data
       const userRef = collection(db, 'users');
       const userSnapshot = await getDocs(query(userRef, where('email', '==', user.email)));
       const clientData = userSnapshot.docs[0]?.data();
       setClient({ ...clientData, uid: user.uid });
 
+      // Get all service providers
       const providerSnapshot = await getDocs(query(userRef, where('role', '==', 'service-provider')));
-      setProviders(providerSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      setProviders(
+        providerSnapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+          uid: doc.data().uid
+        }))
+      );
 
+      // Get bookings
       const bookingSnapshot = await getDocs(query(collection(db, 'bookings'), where('clientId', '==', user.uid)));
       setBookings(bookingSnapshot.docs.map(doc => doc.data()));
-    };
+    });
 
-    fetchData();
+    return () => unsubscribe();
   }, [navigate]);
+
+  // Provider status from Realtime DB
+  useEffect(() => {
+    const dbRealtime = getDatabase();
+    const statusRef = ref(dbRealtime, '/status');
+    onValue(statusRef, (snapshot) => {
+      setProviderStatuses(snapshot.val() || {});
+    });
+  }, []);
 
   const handleLogout = async () => {
     await signOut(auth);
@@ -37,16 +59,14 @@ const ClientDashboard = () => {
   };
 
   const handleBookNow = (provider) => {
-    navigate('/payment', { state: { provider, client } });
+    navigate('/service-details', { state: { provider, client } });
   };
 
   const toggleSidebar = () => setShowSidebar(prev => !prev);
-
   const closeSidebar = () => setShowSidebar(false);
-
   const goToProfile = () => {
     navigate('/client-profile', { state: { client } });
-    closeSidebar(); // Close sidebar when navigating away
+    closeSidebar();
   };
 
   return (
@@ -67,13 +87,7 @@ const ClientDashboard = () => {
       {showSidebar && (
         <div style={styles.sidebar}>
           <div style={styles.sidebarHeader}>
-            <button
-              onClick={closeSidebar}
-              style={styles.closeButton}
-              aria-label="Close Sidebar"
-            >
-              ❌
-            </button>
+            <button onClick={closeSidebar} style={styles.closeButton}>❌</button>
             <img
               src={client?.imageURL || 'https://dummyimage.com/100x100/cccccc/ffffff&text=No+Image'}
               alt="Profile"
@@ -89,27 +103,38 @@ const ClientDashboard = () => {
         </div>
       )}
 
-      {/* Below Navbar */}
+      {/* Welcome */}
       <div style={styles.nameContainer}>
         <span style={styles.clientName}>
           Welcome, {client?.name || 'Client'}
         </span>
       </div>
 
-      {/* Services */}
+      {/* Providers */}
       <div style={styles.content}>
         <h3 style={styles.sectionTitle}>📋 Available Service Providers</h3>
         <div style={styles.cardContainer}>
-          {providers.map(provider => (
-            <div key={provider.id} style={styles.card}>
-              <h4>{provider.serviceType}</h4>
-              <p><strong>Name:</strong> {provider.name}</p>
-              <p><strong>Location:</strong> {provider.location}</p>
-              <p><strong>Price:</strong> ₹{provider.price}</p>
-              <p><strong>Rating:</strong> ⭐ {provider.rating || 4.5}</p>
-              <button style={styles.bookButton} onClick={() => handleBookNow(provider)}>Book Now</button>
-            </div>
-          ))}
+          {providers.map(provider => {
+            const isOnline = providerStatuses[provider.uid]?.online;
+            return (
+              <div key={provider.id} style={styles.card}>
+                <h4>{provider.serviceType}</h4>
+                <p><strong>Name:</strong> {provider.name}</p>
+                <p><strong>Location:</strong> {provider.location}</p>
+                <p><strong>Price:</strong> ₹{provider.price}</p>
+                <p><strong>Rating:</strong> ⭐ {provider.rating || 4.5}</p>
+                <p>
+                  <strong>Status:</strong>{" "}
+                  <span style={{ color: isOnline ? 'green' : 'red' }}>
+                    {isOnline ? '🟢 Online' : '🔴 Offline'}
+                  </span>
+                </p>
+                <button style={styles.bookButton} onClick={() => handleBookNow(provider)}>
+                  Book Now
+                </button>
+              </div>
+            );
+          })}
         </div>
 
         {/* Booking History */}
