@@ -1,176 +1,293 @@
-import React, { useEffect, useState } from 'react';
-import { auth, db } from '../firebase';
+import React, { useEffect, useState, useRef } from "react";
+import { auth, db } from "../firebase";
 import {
   collection,
-  getDocs,
-  query,
-  where,
-  updateDoc,
   doc,
   getDoc,
+  onSnapshot,
+  query,
+  where,
+  serverTimestamp,
+  updateDoc,
   setDoc,
-} from 'firebase/firestore';
-import { signOut, onAuthStateChanged } from 'firebase/auth';
-import {
-  getDatabase,
-  ref as rtdbRef,
-  set as rtdbSet,
-  onDisconnect,
-  onValue,
-} from 'firebase/database';
-import { useNavigate } from 'react-router-dom';
-import './ProviderDashboard.css';
+} from "firebase/firestore";
+import { signOut, onAuthStateChanged } from "firebase/auth";
+import { getDatabase, ref as rtdbRef, set as rtdbSet, onDisconnect } from "firebase/database";
+import { useNavigate } from "react-router-dom";
+import ChatWindow from "./ChatWindow";
+import "./ProviderDashboard.css";
 
 const ProviderDashboard = () => {
   const [bookings, setBookings] = useState([]);
-  const [services, setServices] = useState([]);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [providerInfo, setProviderInfo] = useState({});
   const [currentUser, setCurrentUser] = useState(null);
-  const [isOnline, setIsOnline] = useState(false);
-  const [lastSeen, setLastSeen] = useState(null);
-
+  const [chatUser, setChatUser] = useState(null);
+  const [unreadChats, setUnreadChats] = useState({});
+  const [activeMenu, setActiveMenu] = useState("Dashboard");
+  const [phone, setPhone] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const navigate = useNavigate();
+  const messageUnsubsRef = useRef({});
 
+  const toggleSidebar = () => setSidebarOpen(prev => !prev);
+
+  // ====== Auth & Real-time Bookings ======
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      if (user) {
-        setCurrentUser(user);
-        setProviderOnlineStatus(user.uid);
-        fetchProviderData(user.uid);
+    const unsubAuth = onAuthStateChanged(auth, async (user) => {
+      if (!user) return navigate("/auth");
+      setCurrentUser(user);
 
-        const dbRealtime = getDatabase();
-        const statusRef = rtdbRef(dbRealtime, `/status/${user.uid}`);
-        onValue(statusRef, (snapshot) => {
-          const data = snapshot.val();
-          if (data) {
-            setIsOnline(data.online);
-            setLastSeen(data.lastSeen);
-          }
-        });
+      // Provider online/offline status
+      const dbRealtime = getDatabase();
+      const statusRef = rtdbRef(dbRealtime, `/status/${user.uid}`);
+      rtdbSet(statusRef, { online: true, lastSeen: Date.now() });
+      onDisconnect(statusRef).set({ online: false, lastSeen: Date.now() });
+
+      // Provider info
+      const docSnap = await getDoc(doc(db, "users", user.uid));
+      if (docSnap.exists()) {
+        setProviderInfo(docSnap.data());
+        setPhone(docSnap.data()?.phone || "");
       } else {
-        navigate('/auth');
+        await setDoc(doc(db, "users", user.uid), { role: "service-provider", createdAt: serverTimestamp() }, { merge: true });
       }
+
+      // Real-time bookings
+      const bookingsRef = collection(db, "bookings");
+      const bookingsQuery = query(bookingsRef, where("providerId", "==", user.uid));
+
+      const unsubBookings = onSnapshot(bookingsQuery, async (snapshot) => {
+        const enrichedBookings = await Promise.all(
+          snapshot.docs.map(async (d) => {
+            const b = { id: d.id, ...d.data() };
+            if (b.clientId) {
+              const clientDoc = await getDoc(doc(db, "users", b.clientId));
+              if (clientDoc.exists()) b.clientDetails = clientDoc.data();
+            }
+            return b;
+          })
+        );
+        enrichedBookings.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+        setBookings(enrichedBookings);
+      });
+
+      // Real-time chat unread messages
+      const chatsRef = collection(db, "chats");
+      const chatsQuery = query(chatsRef, where("participants", "array-contains", user.uid));
+      onSnapshot(chatsQuery, snap => {
+        snap.docs.forEach(chatDoc => {
+          const chatId = chatDoc.id;
+          if (messageUnsubsRef.current[chatId]) return;
+
+          const msgsUnsub = onSnapshot(collection(db, "chats", chatId, "messages"), msgsSnap => {
+            const msgs = msgsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+            const unseen = msgs.filter(m => !m.seen && m.senderId !== user.uid);
+            setUnreadChats(prev => ({ ...prev, [chatId]: unseen.length }));
+          });
+
+          messageUnsubsRef.current[chatId] = msgsUnsub;
+        });
+      });
+
+      return () => unsubBookings();
     });
-    return () => unsubscribe();
-  }, []);
 
-  const setProviderOnlineStatus = (uid) => {
-    const dbRealtime = getDatabase();
-    const statusRef = rtdbRef(dbRealtime, `/status/${uid}`);
+    return () => {
+      unsubAuth();
+      Object.values(messageUnsubsRef.current).forEach(u => u && u());
+    };
+  }, [navigate]);
 
-    rtdbSet(statusRef, {
-      online: true,
-      lastSeen: Date.now(),
-    });
-
-    onDisconnect(statusRef).set({
-      online: false,
-      lastSeen: Date.now(),
-    });
-  };
-
-  const fetchProviderData = async (uid) => {
-    const bookingsRef = collection(db, 'bookings');
-    const servicesRef = collection(db, 'services');
-    const providerDocRef = doc(db, 'providers', uid);
-
-    const bookingsSnapshot = await getDocs(
-      query(bookingsRef, where('providerId', '==', uid))
-    );
-    const servicesSnapshot = await getDocs(
-      query(servicesRef, where('providerId', '==', uid))
-    );
-
-    setBookings(bookingsSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })));
-    setServices(servicesSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })));
-
-    const providerDoc = await getDoc(providerDocRef);
-    if (providerDoc.exists()) {
-      setProviderInfo(providerDoc.data());
-    } else {
-      await setDoc(providerDocRef, {}, { merge: true });
-    }
-  };
-
+  // ====== Actions ======
   const handleLogout = async () => {
     if (currentUser) {
       const dbRealtime = getDatabase();
       const statusRef = rtdbRef(dbRealtime, `/status/${currentUser.uid}`);
-      await rtdbSet(statusRef, {
-        online: false,
-        lastSeen: Date.now(),
-      });
+      await rtdbSet(statusRef, { online: false, lastSeen: Date.now() });
     }
     await signOut(auth);
-    navigate('/auth');
+    navigate("/auth");
   };
 
   const confirmBooking = async (bookingId) => {
-    await updateDoc(doc(db, 'bookings', bookingId), { status: 'Approved' });
-    fetchProviderData(currentUser.uid);
+    await updateDoc(doc(db, "bookings", bookingId), { status: "Approved" });
   };
 
-  const totalEarnings = bookings
-    .filter((b) => b.status === 'Completed' && b.paymentReleased)
-    .reduce((sum, b) => sum + Number(b.price || 0), 0);
+  const rejectBooking = async (bookingId) => {
+    await updateDoc(doc(db, "bookings", bookingId), { status: "Rejected" });
+  };
+
+  const completeBooking = async (bookingId) => {
+    const bookingRef = doc(db, "bookings", bookingId);
+    const bookingSnap = await getDoc(bookingRef);
+    if (!bookingSnap.exists()) return;
+    const bookingData = bookingSnap.data();
+    // Do NOT release payment yet, client pays after completion
+    await updateDoc(bookingRef, { status: "Completed" });
+  };
+
+  const updatePhone = async () => {
+    if (!currentUser) return;
+    await updateDoc(doc(db, "users", currentUser.uid), { phone });
+    setProviderInfo(prev => ({ ...prev, phone }));
+    alert("Phone number updated!");
+  };
+
+  const openChat = async (clientObj) => {
+    if (!clientObj || !currentUser) return;
+    const clientUid = clientObj.id || clientObj.uid || clientObj.clientId;
+    const chatId = [currentUser.uid, clientUid].sort().join("_");
+    const chatRef = doc(db, "chats", chatId);
+    const snap = await getDoc(chatRef);
+    if (!snap.exists())
+      await setDoc(chatRef, { participants: [currentUser.uid, clientUid], createdAt: serverTimestamp(), lastMessage: "", lastTimestamp: serverTimestamp() });
+    setChatUser({ uid: clientUid, name: clientObj?.name || clientObj?.clientName || clientObj?.email, chatId });
+    setUnreadChats(prev => ({ ...prev, [chatId]: 0 }));
+  };
+
+  // ====== Stats ======
+  const totalBookings = bookings.length;
+  const pendingBookings = bookings.filter(b => b.status === "Pending").length;
+  const approvedBookings = bookings.filter(b => b.status === "Approved").length;
+  const completedBookings = bookings.filter(b => b.status === "Completed").length;
+  const earnings = bookings
+    .filter(b => b.status === "Completed" && b.paymentReleased)
+    .reduce((sum, b) => sum + Number(b.amount || 0), 0);
+
+  const menuItems = ["Dashboard", "Bookings", "Profile", "Settings"];
 
   return (
-    <div className="dashboard-container">
-      {/* Sidebar */}
-      <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
-        <h2>Service Provider</h2>
-        <p><strong>Name:</strong> {providerInfo?.name || 'N/A'}</p>
-        <p><strong>Email:</strong> {currentUser?.email}</p>
-        <p>
-          <strong>Status:</strong>{' '}
-          {isOnline
-            ? '🟢 Online'
-            : `🔴 Offline (Last seen: ${
-                lastSeen ? new Date(lastSeen).toLocaleString() : 'N/A'
-              })`}
-        </p>
+    <div className="dashboard-wrapper">
+      <button className="hamburger-btn" onClick={toggleSidebar}>☰</button>
 
-        <ul className="sidebar-links">
-          <li onClick={() => navigate('/ProviderDashboard')}>Dashboard</li>
-          <li onClick={() => navigate('/provider/profile')}>Profile</li>
+      <div className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+        <h2>{providerInfo?.name || "Provider"}</h2>
+        <ul>
+          {menuItems.map(item => (
+            <li key={item} className={activeMenu === item ? "active" : ""} onClick={() => { setActiveMenu(item); toggleSidebar(); }}>
+              {item}
+            </li>
+          ))}
           <li onClick={handleLogout}>Logout</li>
         </ul>
       </div>
 
-      {/* Main Content */}
       <div className="main-content">
-        <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>
-          &#9776;
-        </button>
-        <h1>Welcome, {providerInfo?.name || 'Provider'}</h1>
+        {activeMenu === "Dashboard" && (
+          <>
+            <h2 style={{ textAlign: "center", marginBottom: "20px", color: "#1890ff" }}>
+              Welcome, {providerInfo?.name || "Provider"}!
+            </h2>
 
-        <div className="stats">
-          <div className="stat-card"><h3>{bookings.length}</h3><p>Total Bookings</p></div>
-          <div className="stat-card"><h3>{services.length}</h3><p>Services Listed</p></div>
-          <div className="stat-card"><h3>{bookings.filter(b => b.status === 'Pending').length}</h3><p>Pending</p></div>
-          <div className="stat-card"><h3>{bookings.filter(b => b.status === 'Approved').length}</h3><p>Approved</p></div>
-          <div className="stat-card"><h3>₹{totalEarnings}</h3><p>Total Earnings</p></div>
-        </div>
-
-        <div className="bookings-section">
-          <h2>Recent Client Bookings</h2>
-          {bookings.length === 0 && <p>No bookings yet.</p>}
-          {bookings.map((booking) => (
-            <div key={booking.id} className="booking-card">
-              <p><strong>Client:</strong> {booking.clientName}</p>
-              <p><strong>Service:</strong> {booking.serviceType}</p>
-              <p><strong>Location:</strong> {booking.location}</p>
-              <p><strong>Price:</strong> ₹{booking.price || 'N/A'}</p>
-              <p><strong>Status:</strong> {booking.status}</p>
-              {booking.status === 'Pending' && (
-                <button className="confirm-btn" onClick={() => confirmBooking(booking.id)}>
-                  Confirm
-                </button>
-              )}
+            <div className="stats-grid">
+              <div className="stat-card"><h3>{totalBookings}</h3><p>Total Bookings</p></div>
+              <div className="stat-card"><h3>{pendingBookings}</h3><p>Pending</p></div>
+              <div className="stat-card"><h3>{approvedBookings}</h3><p>Approved</p></div>
+              <div className="stat-card"><h3>{completedBookings}</h3><p>Completed</p></div>
+              <div className="stat-card"><h3>₹{earnings}</h3><p>Earnings</p></div>
             </div>
-          ))}
-        </div>
+
+            <h3 className="section-title">Recent Bookings</h3>
+            <div className="bookings-grid">
+              {bookings.slice(0, 5).map(b => {
+                const chatId = [currentUser?.uid, b.clientId].sort().join("_");
+                const unread = unreadChats[chatId] || 0;
+                let statusClass = b.status === "Pending" ? "status-pending" : b.status === "Approved" ? "status-approved" : "status-completed";
+
+                return (
+                  <div key={b.id} className="booking-card">
+                    <div>
+                      <p><strong>Client:</strong> {b.clientDetails?.name || b.clientName}</p>
+                      <p><strong>Email:</strong> {b.clientDetails?.email}</p>
+                      <p><strong>Phone:</strong> {b.clientDetails?.phone || "N/A"}</p>
+                      <p><strong>Status:</strong> <span className={statusClass}>{b.status}</span></p>
+                      {b.status === "Completed" && b.paymentReleased && <p><strong>Amount Paid:</strong> ₹{b.amount}</p>}
+                    </div>
+                    <div style={{ marginTop: "10px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
+                      {b.status === "Pending" && (
+                        <>
+                          <button onClick={() => confirmBooking(b.id)} className="action-btn approve">✅ Approve</button>
+                          <button onClick={() => rejectBooking(b.id)} className="action-btn reject">❌ Reject</button>
+                        </>
+                      )}
+                      {b.status === "Approved" && (
+                        <button onClick={() => completeBooking(b.id)} className="action-btn complete">✔️ Mark Completed</button>
+                      )}
+                      <button onClick={() => openChat({ id: b.clientId, ...b.clientDetails })} className="action-btn chat">
+                        💬 Chat {unread > 0 && `(${unread})`}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {activeMenu === "Bookings" && (
+          <div className="bookings-grid">
+            {bookings.map(b => {
+              const chatId = [currentUser?.uid, b.clientId].sort().join("_");
+              const unread = unreadChats[chatId] || 0;
+              let statusClass = b.status === "Pending" ? "status-pending" : b.status === "Approved" ? "status-approved" : "status-completed";
+
+              return (
+                <div key={b.id} className="booking-card">
+                  <div>
+                    <p><strong>Client:</strong> {b.clientDetails?.name || b.clientName}</p>
+                    <p><strong>Email:</strong> {b.clientDetails?.email}</p>
+                    <p><strong>Phone:</strong> {b.clientDetails?.phone || "N/A"}</p>
+                    <p><strong>Status:</strong> <span className={statusClass}>{b.status}</span></p>
+                    {b.status === "Completed" && b.paymentReleased && <p><strong>Amount Paid:</strong> ₹{b.amount}</p>}
+                  </div>
+                  <div style={{ marginTop: "10px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
+                    {b.status === "Pending" && (
+                      <>
+                        <button onClick={() => confirmBooking(b.id)} className="action-btn approve">✅ Approve</button>
+                        <button onClick={() => rejectBooking(b.id)} className="action-btn reject">❌ Reject</button>
+                      </>
+                    )}
+                    {b.status === "Approved" && (
+                      <button onClick={() => completeBooking(b.id)} className="action-btn complete">✔️ Mark Completed</button>
+                    )}
+                    <button onClick={() => openChat({ id: b.clientId, ...b.clientDetails })} className="action-btn chat">
+                      💬 Chat {unread > 0 && `(${unread})`}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {activeMenu === "Profile" && (
+          <div>
+            <h3>Profile Information</h3>
+            <p><strong>Name:</strong> {providerInfo?.name}</p>
+            <p><strong>Email:</strong> {currentUser?.email}</p>
+            <p>
+              <strong>Phone no:</strong>
+              <input type="text" value={phone} onChange={e => setPhone(e.target.value)} style={{ marginLeft: "10px" }} />
+              <button onClick={updatePhone} style={{ marginLeft: "10px" }}>Update</button>
+            </p>
+          </div>
+        )}
+
+        {activeMenu === "Settings" && (
+          <div>
+            <h3>Settings</h3>
+            <p>Coming soon...</p>
+          </div>
+        )}
+
+        {chatUser && currentUser && (
+          <ChatWindow
+            chatId={chatUser.chatId}
+            currentUser={{ uid: currentUser.uid, displayName: providerInfo?.name, email: currentUser.email }}
+            otherUser={{ uid: chatUser.uid, name: chatUser.name }}
+            onClose={() => setChatUser(null)}
+          />
+        )}
       </div>
     </div>
   );

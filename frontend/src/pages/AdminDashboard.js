@@ -1,11 +1,24 @@
 // src/AdminDashboard.js
 import React, { useEffect, useMemo, useState } from "react";
 import { db, auth } from "../firebase";
-import { signOut } from "firebase/auth";
+import { signOut, sendPasswordResetEmail } from "firebase/auth";
 import { useNavigate } from "react-router-dom";
-import { collection, getDocs, deleteDoc, doc, updateDoc } from "firebase/firestore";
-import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Legend } from "recharts";
+import {
+  collection,
+  deleteDoc,
+  doc,
+  updateDoc,
+  onSnapshot
+} from "firebase/firestore";
+import {
+  ResponsiveContainer,
+  BarChart, Bar, XAxis, YAxis, Tooltip, Legend,
+  LineChart, Line
+} from "recharts";
 
+/* -----------------------
+  Small UI helpers
+----------------------- */
 function StatCard({ title, value, sub }) {
   return (
     <div style={styles.card}>
@@ -16,102 +29,190 @@ function StatCard({ title, value, sub }) {
   );
 }
 
+function Modal({ open, onClose, children, title }) {
+  if (!open) return null;
+  return (
+    <div style={styles.modalOverlay}>
+      <div style={styles.modal}>
+        <div style={styles.modalHeader}>
+          <strong>{title}</strong>
+          <button onClick={onClose} style={styles.modalClose}>✕</button>
+        </div>
+        <div style={styles.modalBody}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* -----------------------
+  Admin Dashboard
+----------------------- */
 export default function AdminDashboard() {
   const navigate = useNavigate();
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
   const [users, setUsers] = useState([]);
   const [bookings, setBookings] = useState([]);
-  const [userCount, setUserCount] = useState(0);
-  const [bookingCount, setBookingCount] = useState(0);
+  const [reviews, setReviews] = useState([]);
 
   const [userRole, setUserRole] = useState("all");
   const [userSearch, setUserSearch] = useState("");
   const [bookingStatus, setBookingStatus] = useState("all");
   const [bookingSearch, setBookingSearch] = useState("");
 
+  const [timeFilter, setTimeFilter] = useState("overall");
+  const [revenueFiltered, setRevenueFiltered] = useState(0);
+  const [bookingsFiltered, setBookingsFiltered] = useState(0);
+  const [pendingPayouts, setPendingPayouts] = useState(0);
+
+  // Modal
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const [profileUser, setProfileUser] = useState(null);
+
+  /* -----------------------
+    Fetch Data
+  ----------------------- */
   useEffect(() => {
-    fetchAllData();
-  }, []);
+    const unsubscribeUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+      setUsers(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
 
-  const fetchAllData = async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const usersSnap = await getDocs(collection(db, "users"));
-      const bookingsSnap = await getDocs(collection(db, "bookings"));
-
-      const usersData = usersSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      const bookingsData = bookingsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-      setUsers(usersData);
+    const unsubscribeBookings = onSnapshot(collection(db, "bookings"), (snapshot) => {
+      const bookingsData = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
       setBookings(bookingsData);
 
-      setUserCount(usersData.length);
-      setBookingCount(bookingsData.length);
-    } catch (e) {
-      console.error(e);
-      setError("Failed to load data. Check Firestore rules & field names.");
-    } finally {
-      setLoading(false);
-    }
+      // Revenue + pending payouts
+      let totalRevenue = 0;
+      let pending = 0;
+      bookingsData.forEach(b => {
+        const amount = Number(b.amount ?? 0);
+        const isPaid = b.paid === true || b.status === "completed" || b.status === "paid";
+        if (isPaid) totalRevenue += amount;
+        else pending += amount;
+      });
+      setRevenueFiltered(totalRevenue);
+      setPendingPayouts(pending);
+      setBookingsFiltered(bookingsData.length);
+    });
+
+    const unsubscribeReviews = onSnapshot(collection(db, "reviews"), (snapshot) => {
+      setReviews(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeBookings();
+      unsubscribeReviews();
+    };
+  }, []);
+
+  /* -----------------------
+    Helpers
+  ----------------------- */
+  const filterBookingsByTime = (bookings, filter) => {
+    const now = new Date();
+    return bookings.filter(b => {
+      if (!b.createdAt?.toDate) return false;
+      const created = b.createdAt.toDate();
+      if (filter === "weekly") {
+        const oneWeekAgo = new Date();
+        oneWeekAgo.setDate(now.getDate() - 7);
+        return created >= oneWeekAgo;
+      } else if (filter === "monthly") {
+        const oneMonthAgo = new Date();
+        oneMonthAgo.setMonth(now.getMonth() - 1);
+        return created >= oneMonthAgo;
+      }
+      return true;
+    });
   };
 
+  const filterUsersByTime = (users, filter) => {
+    const now = new Date();
+    return users.filter(u => {
+      if (!u.createdAt?.toDate) return false;
+      const created = u.createdAt.toDate();
+      if (filter === "weekly") {
+        const oneWeekAgo = new Date();
+        oneWeekAgo.setDate(now.getDate() - 7);
+        return created >= oneWeekAgo;
+      } else if (filter === "monthly") {
+        const oneMonthAgo = new Date();
+        oneMonthAgo.setMonth(now.getMonth() - 1);
+        return created >= oneMonthAgo;
+      }
+      return true;
+    });
+  };
+
+  /* -----------------------
+    Filtered Data
+  ----------------------- */
+  const filteredUsers = useMemo(() => {
+    const timeFiltered = filterUsersByTime(users, timeFilter);
+    return timeFiltered.filter(u => {
+      const roleOk = userRole === "all" || (u.role || "").toLowerCase() === userRole;
+      const q = userSearch.trim().toLowerCase();
+      return (
+        roleOk &&
+        (!q ||
+          (u.name || "").toLowerCase().includes(q) ||
+          (u.email || "").toLowerCase().includes(q))
+      );
+    });
+  }, [users, userRole, userSearch, timeFilter]);
+
+  const filteredBookings = useMemo(() => {
+    const timeFiltered = filterBookingsByTime(bookings, timeFilter);
+    return timeFiltered.filter(b => {
+      const statusOk = bookingStatus === "all" || (b.status || "").toLowerCase() === bookingStatus;
+      const q = bookingSearch.trim().toLowerCase();
+      return (
+        statusOk &&
+        (!q ||
+          (b.clientId || "").toLowerCase().includes(q) ||
+          (b.providerId || "").toLowerCase().includes(q))
+      );
+    });
+  }, [bookings, bookingStatus, bookingSearch, timeFilter]);
+
+  /* -----------------------
+    Actions
+  ----------------------- */
   const handleLogout = async () => {
     await signOut(auth);
     navigate("/Auth");
   };
 
-  const handleDeleteUser = async (id) => {
-    if (window.confirm("Are you sure you want to delete this user?")) {
-      await deleteDoc(doc(db, "users", id));
-      fetchAllData();
-    }
+  const toggleBlockUser = async (uid, currentlyBlocked) => {
+    await updateDoc(doc(db, "users", uid), { blocked: !currentlyBlocked });
+  };
+
+  const approveProvider = async (uid, approve = true) => {
+    await updateDoc(doc(db, "users", uid), { approved: approve });
+  };
+
+  const handleDeleteUser = async (uid) => {
+    await deleteDoc(doc(db, "users", uid));
+  };
+
+  const sendResetEmail = async (email) => {
+    await sendPasswordResetEmail(auth, email);
+  };
+
+  const cancelBooking = async (id) => {
+    await updateDoc(doc(db, "bookings", id), { status: "cancelled" });
   };
 
   const handleDeleteBooking = async (id) => {
-    if (window.confirm("Are you sure you want to delete this booking?")) {
-      await deleteDoc(doc(db, "bookings", id));
-      fetchAllData();
-    }
+    await deleteDoc(doc(db, "bookings", id));
   };
-
-  const handleUpdateBookingStatus = async (id, status) => {
-    await updateDoc(doc(db, "bookings", id), { status });
-    fetchAllData();
-  };
-
-  const filteredUsers = useMemo(() => {
-    return users.filter((u) => {
-      const roleOk = userRole === "all" || (u.role || "").toLowerCase() === userRole;
-      const q = userSearch.trim().toLowerCase();
-      return roleOk && (!q || (u.name || "").toLowerCase().includes(q) || (u.email || "").toLowerCase().includes(q));
-    });
-  }, [users, userRole, userSearch]);
-
-  const filteredBookings = useMemo(() => {
-    return bookings.filter((b) => {
-      const statusOk = bookingStatus === "all" || (b.status || "").toLowerCase() === bookingStatus;
-      const q = bookingSearch.trim().toLowerCase();
-      return statusOk && (!q || (b.clientId || "").toLowerCase().includes(q) || (b.providerId || "").toLowerCase().includes(q) || (b.id || "").toLowerCase().includes(q));
-    });
-  }, [bookings, bookingStatus, bookingSearch]);
 
   const getUserName = (id) => users.find((u) => u.id === id)?.name || "—";
 
-  // Graph Data
-  const usersRoleData = useMemo(() => {
-    const roles = { client: 0, "service-provider": 0, admin: 0 };
-    users.forEach(u => {
-      const role = (u.role || "unknown").toLowerCase();
-      if (roles[role] !== undefined) roles[role]++;
-    });
-    return Object.entries(roles).map(([name, value]) => ({ name, value }));
-  }, [users]);
-
+  /* -----------------------
+    Charts
+  ----------------------- */
   const bookingsStatusData = useMemo(() => {
-    const statuses = { pending: 0, confirmed: 0, completed: 0, cancelled: 0 };
+    const statuses = { pending: 0, confirmed: 0, approved: 0, cancelled: 0 };
     bookings.forEach(b => {
       const status = (b.status || "pending").toLowerCase();
       if (statuses[status] !== undefined) statuses[status]++;
@@ -119,188 +220,187 @@ export default function AdminDashboard() {
     return Object.entries(statuses).map(([status, count]) => ({ status, count }));
   }, [bookings]);
 
-  const COLORS = ["#8884d8", "#82ca9d", "#ffc658", "#ff8042"];
+  const revenueOverTime = useMemo(() => {
+    const map = {};
+    bookings.forEach(b => {
+      const amount = Number(b.amount ?? 0);
+      const isPaid = b.paid === true || b.status === "completed" || b.status === "paid";
+      if (!isPaid || !b.createdAt?.toDate) return;
+      const date = b.createdAt.toDate();
+      const key = `${date.getFullYear()}-${date.getMonth()+1}-${date.getDate()}`;
+      map[key] = (map[key] || 0) + amount;
+    });
+    return Object.entries(map)
+      .sort(([a], [b]) => new Date(a) - new Date(b))
+      .map(([date, revenue]) => ({ date, revenue }));
+  }, [bookings]);
 
-  if (loading) return <div style={{ padding: 24 }}>Loading dashboard…</div>;
+  const completedPendingData = useMemo(() => {
+    let completed = 0, pending = 0;
+    bookings.forEach(b => {
+      const amount = Number(b.amount ?? 0);
+      const isPaid = b.paid === true || b.status === "completed" || b.status === "paid";
+      if (isPaid) completed += amount;
+      else pending += amount;
+    });
+    return [
+      { name: "Completed", amount: completed },
+      { name: "Pending", amount: pending }
+    ];
+  }, [bookings]);
 
   return (
-    <div style={styles.wrap}>
-      <aside style={styles.sidebar}>
-        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 24 }}>Admin Panel</div>
-        <a href="#overview" style={styles.navItem}>Overview</a>
-        <a href="#users" style={styles.navItem}>Users</a>
-        <a href="#bookings" style={styles.navItem}>Bookings</a>
-        <a href="#graphs" style={styles.navItem}>Graphs</a>
-        <button onClick={handleLogout} style={styles.logoutButton}>Logout</button>
-      </aside>
+    <div style={styles.container}>
+      <div style={styles.header}>
+        <h2>Admin Dashboard</h2>
+        <button onClick={handleLogout} style={styles.logoutBtn}>Logout</button>
+      </div>
 
-      <main style={styles.main}>
-        {error && <div style={styles.error}>{error}</div>}
+      <div style={{ marginBottom: 12 }}>
+        <span>View stats for: </span>
+        <select value={timeFilter} onChange={(e) => setTimeFilter(e.target.value)} style={styles.select}>
+          <option value="weekly">Last 7 days</option>
+          <option value="monthly">Last 30 days</option>
+          <option value="overall">Overall</option>
+        </select>
+      </div>
 
-        <h1 id="overview">Dashboard Overview</h1>
-        <div style={styles.grid3}>
-          <StatCard title="Total Users" value={userCount} sub="All roles" />
-          <StatCard title="Total Bookings" value={bookingCount} sub="All statuses" />
-          <StatCard
-            title="Service Providers"
-            value={users.filter((u) => (u.role || "").toLowerCase() === "service-provider").length}
-            sub="From users list"
-          />
+      <div style={styles.grid3}>
+        <StatCard title="Total Users" value={filteredUsers.length} sub={timeFilter} />
+        <StatCard title="Total Bookings" value={filteredBookings.length} sub={timeFilter} />
+        <StatCard title="Revenue" value={`₹${revenueFiltered}`} sub="Collected" />
+        <StatCard title="Pending Payouts" value={`₹${pendingPayouts}`} />
+      </div>
+
+      <div style={styles.grid2}>
+        <div style={styles.chartCard}>
+          <h4>Revenue Over Time</h4>
+          <ResponsiveContainer width="100%" height={250}>
+            <LineChart data={revenueOverTime}>
+              <XAxis dataKey="date" />
+              <YAxis />
+              <Tooltip />
+              <Line type="monotone" dataKey="revenue" stroke="#1976d2" strokeWidth={2} />
+            </LineChart>
+          </ResponsiveContainer>
         </div>
+        <div style={styles.chartCard}>
+          <h4>Bookings by Status</h4>
+          <ResponsiveContainer width="100%" height={250}>
+            <BarChart data={bookingsStatusData}>
+              <XAxis dataKey="status" />
+              <YAxis />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="count" fill="#43a047" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <div style={styles.chartCard}>
+          <h4>Completed vs Pending Payouts</h4>
+          <ResponsiveContainer width="100%" height={250}>
+            <BarChart data={completedPendingData}>
+              <XAxis dataKey="name" />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="amount" fill="#ff9800" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
 
-        {/* Graphs Section */}
-        <section id="graphs" style={{ marginTop: 32 }}>
-          <h2>Graphs</h2>
-          <div style={{ display: "flex", gap: 32, flexWrap: "wrap" }}>
-            {/* Users per Role Pie Chart */}
-            <div style={{ flex: 1, minWidth: 300, height: 300, background: "white", borderRadius: 16, padding: 16, boxShadow: "0 6px 20px rgba(0,0,0,0.06)" }}>
-              <h4 style={{ textAlign: "center" }}>Users by Role</h4>
-              <ResponsiveContainer width="100%" height="80%">
-                <PieChart>
-                  <Pie data={usersRoleData} dataKey="value" nameKey="name" outerRadius={80} fill="#8884d8" label>
-                    {usersRoleData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
+      {/* Users Table */}
+      <div style={styles.tableCard}>
+        <h4>Users</h4>
+        <table style={styles.table}>
+          <thead>
+            <tr>
+              <th>Name</th><th>Email</th><th>Role</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredUsers.map(u => (
+              <tr key={u.id}>
+                <td>{u.name}</td>
+                <td>{u.email}</td>
+                <td>{u.role}</td>
+                <td>
+                  <button style={styles.btnBlue} onClick={() => { setProfileModalOpen(true); setProfileUser(u); }}>View</button>
+                  <button style={styles.btnOrange} onClick={() => toggleBlockUser(u.id, u.blocked)}>{u.blocked ? "Unblock" : "Block"}</button>
+                  {u.role === "service-provider" && !u.approved && (
+                    <button style={styles.btnGreen} onClick={() => approveProvider(u.id, true)}>Approve</button>
+                  )}
+                  <button style={styles.btnRed} onClick={() => handleDeleteUser(u.id)}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
-            {/* Bookings per Status Bar Chart */}
-            <div style={{ flex: 1, minWidth: 300, height: 300, background: "white", borderRadius: 16, padding: 16, boxShadow: "0 6px 20px rgba(0,0,0,0.06)" }}>
-              <h4 style={{ textAlign: "center" }}>Bookings by Status</h4>
-              <ResponsiveContainer width="100%" height="80%">
-                <BarChart data={bookingsStatusData}>
-                  <XAxis dataKey="status" />
-                  <YAxis />
-                  <Tooltip />
-                  <Legend />
-                  <Bar dataKey="count" fill="#82ca9d" />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </section>
+      {/* Bookings Table */}
+      <div style={styles.tableCard}>
+        <h4>Bookings</h4>
+        <table style={styles.table}>
+          <thead>
+            <tr>
+              <th>ID</th><th>Client</th><th>Provider</th><th>Status</th><th>Amount</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredBookings.map(b => (
+              <tr key={b.id}>
+                <td>{b.id}</td>
+                <td>{getUserName(b.clientId)}</td>
+                <td>{getUserName(b.providerId)}</td>
+                <td>{b.status}</td>
+                <td>{b.amount}</td>
+                <td>
+                  <button style={styles.btnOrange} onClick={() => cancelBooking(b.id)}>Cancel</button>
+                  <button style={styles.btnRed} onClick={() => handleDeleteBooking(b.id)}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
-        {/* Users Section */}
-        <section id="users" style={{ marginTop: 32 }}>
-          <div style={styles.sectionHeader}>
-            <h2>Users</h2>
-            <div style={styles.filtersRow}>
-              <input type="text" placeholder="Search users" value={userSearch} onChange={(e) => setUserSearch(e.target.value)} style={styles.input} />
-              <select value={userRole} onChange={(e) => setUserRole(e.target.value)} style={styles.select}>
-                <option value="all">All roles</option>
-                <option value="client">Client</option>
-                <option value="service-provider">Service Provider</option>
-                <option value="admin">Admin</option>
-              </select>
-            </div>
+      {/* Profile Modal */}
+      <Modal open={profileModalOpen} onClose={() => setProfileModalOpen(false)} title="User Profile">
+        {profileUser && (
+          <div>
+            <p><strong>Name:</strong> {profileUser.name}</p>
+            <p><strong>Email:</strong> {profileUser.email}</p>
+            <p><strong>Role:</strong> {profileUser.role}</p>
           </div>
-          <div style={styles.tableWrap}>
-            <table style={styles.table}>
-              <thead>
-                <tr>
-                  <th style={styles.th}>Name</th>
-                  <th style={styles.th}>Email</th>
-                  <th style={styles.th}>Role</th>
-                  <th style={styles.th}>Created</th>
-                  <th style={styles.th}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredUsers.map((u) => (
-                  <tr key={u.id} style={styles.rowHover}>
-                    <td style={styles.td}>{u.name || "—"}</td>
-                    <td style={styles.td}>{u.email || "—"}</td>
-                    <td style={styles.td}>{u.role || "—"}</td>
-                    <td style={styles.td}>{u.createdAt?.toDate ? u.createdAt.toDate().toLocaleString() : "—"}</td>
-                    <td style={styles.td}>
-                      {u.role !== "admin" && (
-                        <button style={styles.deleteBtn} onClick={() => handleDeleteUser(u.id)}>Delete</button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-                {filteredUsers.length === 0 && <tr><td colSpan={5} style={styles.td}>No users found.</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        {/* Bookings Section */}
-        <section id="bookings" style={{ marginTop: 32 }}>
-          <div style={styles.sectionHeader}>
-            <h2>Bookings</h2>
-            <div style={styles.filtersRow}>
-              <input type="text" placeholder="Search bookings" value={bookingSearch} onChange={(e) => setBookingSearch(e.target.value)} style={styles.input} />
-              <select value={bookingStatus} onChange={(e) => setBookingStatus(e.target.value)} style={styles.select}>
-                <option value="all">All statuses</option>
-                <option value="pending">Pending</option>
-                <option value="confirmed">Confirmed</option>
-                <option value="completed">Completed</option>
-                <option value="cancelled">Cancelled</option>
-              </select>
-            </div>
-          </div>
-          <div style={styles.tableWrap}>
-            <table style={styles.table}>
-              <thead>
-                <tr>
-                  <th style={styles.th}>Booking ID</th>
-                  <th style={styles.th}>Client</th>
-                  <th style={styles.th}>Provider</th>
-                  <th style={styles.th}>Status</th>
-                  <th style={styles.th}>Created</th>
-                  <th style={styles.th}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredBookings.map((b) => (
-                  <tr key={b.id} style={styles.rowHover}>
-                    <td style={styles.td}>{b.id}</td>
-                    <td style={styles.td}>{getUserName(b.clientId)}</td>
-                    <td style={styles.td}>{getUserName(b.providerId)}</td>
-                    <td style={styles.td}>{b.status || "—"}</td>
-                    <td style={styles.td}>{b.createdAt?.toDate ? b.createdAt.toDate().toLocaleString() : "—"}</td>
-                    <td style={styles.td}>
-                      <button style={styles.deleteBtn} onClick={() => handleDeleteBooking(b.id)}>Delete</button>
-                      {b.status !== "confirmed" && (
-                        <button style={styles.approveBtn} onClick={() => handleUpdateBookingStatus(b.id, "confirmed")}>Confirm</button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-                {filteredBookings.length === 0 && <tr><td colSpan={6} style={styles.td}>No bookings found.</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        
-      </main>
+        )}
+      </Modal>
     </div>
   );
 }
 
+/* -----------------------
+  Styles
+----------------------- */
 const styles = {
-  wrap: { display: "grid", gridTemplateColumns: "260px 1fr", minHeight: "100vh", background: "#f6f8fb" },
-  sidebar: { padding: 20, background: "#0f172a", color: "white", position: "sticky", top: 0, height: "100vh" },
-  navItem: { display: "block", padding: "10px 12px", borderRadius: 10, textDecoration: "none", color: "white", opacity: 0.9, marginBottom: 6, background: "rgba(255,255,255,0.06)" },
-  main: { padding: 24 },
-  grid3: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 16, marginTop: 16 },
-  card: { background: "white", padding: 16, borderRadius: 16, boxShadow: "0 6px 20px rgba(0,0,0,0.06)" },
-  sectionHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 10 },
-  filtersRow: { display: "flex", gap: 8 },
-  input: { padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb", background: "white", minWidth: 260, outline: "none" },
-  select: { padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb", background: "white", outline: "none" },
-  logoutButton: { marginTop: 24, padding: "10px 12px", borderRadius: 10, border: "none", background: "#dc2626", color: "white", cursor: "pointer", fontWeight: 600, width: "100%" },
-  tableWrap: { background: "white", borderRadius: 16, overflow: "hidden", boxShadow: "0 6px 20px rgba(0,0,0,0.06)" },
+  container: { padding: 20, fontFamily: "Arial, sans-serif" },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 },
+  logoutBtn: { padding: "6px 12px", cursor: "pointer" },
+  grid3: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 20 },
+  grid2: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12, marginBottom: 20 },
+  card: { padding: 12, background: "#f5f5f5", borderRadius: 8, textAlign: "center" },
+  chartCard: { padding: 12, background: "#fff", borderRadius: 8 },
+  tableCard: { padding: 12, background: "#fff", borderRadius: 8, marginBottom: 20 },
   table: { width: "100%", borderCollapse: "collapse" },
-  th: { textAlign: "left", padding: "12px 14px", background: "#f1f5f9", fontWeight: 700, borderBottom: "1px solid #e5e7eb", fontSize: 13 },
-  td: { padding: "12px 14px", borderBottom: "1px solid #f1f5f9", fontSize: 14 },
-  rowHover: { transition: "background 0.2s", cursor: "default" },
-  error: { background: "#fee2e2", color: "#991b1b", padding: 12, borderRadius: 12, marginBottom: 12 },
-  deleteBtn: { background: "#dc2626", color: "white", border: "none", padding: "5px 8px", borderRadius: 6, marginRight: 6, cursor: "pointer" },
-  approveBtn: { background: "#16a34a", color: "white", border: "none", padding: "5px 8px", borderRadius: 6, cursor: "pointer" },
+  btnBlue: { background: "#1976d2", color: "white", padding: "4px 8px", margin: 2, border: "none", borderRadius: 4 },
+  btnGreen: { background: "#43a047", color: "white", padding: "4px 8px", margin: 2, border: "none", borderRadius: 4 },
+  btnOrange: { background: "#f57c00", color: "white", padding: "4px 8px", margin: 2, border: "none", borderRadius: 4 },
+  btnRed: { background: "#d32f2f", color: "white", padding: "4px 8px", margin: 2, border: "none", borderRadius: 4 },
+  input: { padding: 6, marginRight: 8, marginBottom: 8 },
+  select: { padding: 6, marginRight: 8, marginBottom: 8 },
+  modalOverlay: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.4)", display: "flex", justifyContent: "center", alignItems: "center" },
+  modal: { background: "#fff", borderRadius: 8, width: 400, maxWidth: "90%", padding: 16 },
+  modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
+  modalClose: { cursor: "pointer", border: "none", background: "transparent", fontSize: 16 },
+  modalBody: { fontSize: 14 }
 };

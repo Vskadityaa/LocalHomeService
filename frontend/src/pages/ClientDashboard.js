@@ -1,113 +1,137 @@
-import React, { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { auth, db } from '../firebase';
-import { collection, getDocs, query, where } from 'firebase/firestore';
-import { signOut, onAuthStateChanged } from 'firebase/auth';
-import { getDatabase, ref, onValue } from 'firebase/database';
+import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { auth, db } from "../firebase";
+import {
+  collection,
+  getDocs,
+  query,
+  where,
+  onSnapshot,
+  doc,
+  setDoc,
+  getDoc,
+  serverTimestamp,
+} from "firebase/firestore";
+import { signOut, onAuthStateChanged } from "firebase/auth";
+import { getDatabase, ref, onValue } from "firebase/database";
+import ChatWindow from "./ChatWindow";
+
+// Create chat if not exists
+const getOrCreateChat = async (currentUser, otherUser) => {
+  const chatId = [currentUser.uid, otherUser.uid].sort().join("_");
+  const chatRef = doc(db, "chats", chatId);
+  await setDoc(
+    chatRef,
+    { participants: [currentUser.uid, otherUser.uid], lastMessage: "", lastTimestamp: serverTimestamp() },
+    { merge: true }
+  );
+  return chatId;
+};
 
 const ClientDashboard = () => {
   const [providers, setProviders] = useState([]);
   const [client, setClient] = useState(null);
   const [bookings, setBookings] = useState([]);
-  const [showSidebar, setShowSidebar] = useState(false);
   const [providerStatuses, setProviderStatuses] = useState({});
+  const [chatUser, setChatUser] = useState(null);
+  const [unseenChats, setUnseenChats] = useState({});
+  const [showSidebar, setShowSidebar] = useState(false);
   const navigate = useNavigate();
 
+  // Authentication & data fetch
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        navigate('/auth'); // go to login only if NOT logged in
-        return;
-      }
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (!user) return navigate("/auth");
 
-      // Get logged-in client data
-      const userRef = collection(db, 'users');
-      const userSnapshot = await getDocs(query(userRef, where('email', '==', user.email)));
-      const clientData = userSnapshot.docs[0]?.data();
-      setClient({ ...clientData, uid: user.uid });
+      // Fetch Firestore user data
+      const userDocRef = doc(db, "users", user.uid);
+      const userSnap = await getDoc(userDocRef);
+      const data = userSnap.exists() ? userSnap.data() : {};
 
-      // Get all service providers
-      const providerSnapshot = await getDocs(query(userRef, where('role', '==', 'service-provider')));
-      setProviders(
-        providerSnapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-          uid: doc.data().uid
-        }))
-      );
+      setClient({
+        uid: user.uid,
+        email: user.email,
+        name: data.name || "Client",
+        imageURL: data.imageURL || "",
+      });
 
-      // Get bookings
-      const bookingSnapshot = await getDocs(query(collection(db, 'bookings'), where('clientId', '==', user.uid)));
-      setBookings(bookingSnapshot.docs.map(doc => doc.data()));
+      // Fetch providers
+      const usersRef = collection(db, "users");
+      const providerSnap = await getDocs(query(usersRef, where("role", "==", "service-provider")));
+      setProviders(providerSnap.docs.map(d => ({ id: d.id, ...d.data(), uid: d.data().uid || d.id })));
+
+      // Fetch bookings
+      const bookingSnap = await getDocs(query(collection(db, "bookings"), where("clientId", "==", user.uid)));
+      setBookings(bookingSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+
+      // Fetch unseen chats
+      const chatsRef = collection(db, "chats");
+      const chatsQuery = query(chatsRef, where("participants", "array-contains", user.uid));
+      onSnapshot(chatsQuery, snap => {
+        snap.docs.forEach(chatDoc => {
+          const chatId = chatDoc.id;
+          onSnapshot(collection(db, "chats", chatId, "messages"), msgsSnap => {
+            const unseen = msgsSnap.docs.filter(m => !m.data().seen && m.data().senderId !== user.uid);
+            setUnseenChats(prev => ({ ...prev, [chatId]: unseen.length }));
+          });
+        });
+      });
     });
 
-    return () => unsubscribe();
+    return () => unsubscribeAuth();
   }, [navigate]);
 
-  // Provider status from Realtime DB
+  // Provider online/offline status
   useEffect(() => {
     const dbRealtime = getDatabase();
-    const statusRef = ref(dbRealtime, '/status');
-    onValue(statusRef, (snapshot) => {
-      setProviderStatuses(snapshot.val() || {});
-    });
+    const statusRef = ref(dbRealtime, "/status");
+    onValue(statusRef, snapshot => setProviderStatuses(snapshot.val() || {}));
   }, []);
 
-  const handleLogout = async () => {
-    await signOut(auth);
-    navigate('/auth');
-  };
-
-  const handleBookNow = (provider) => {
-    navigate('/service-details', { state: { provider, client } });
-  };
-
+  // Handlers
   const toggleSidebar = () => setShowSidebar(prev => !prev);
-  const closeSidebar = () => setShowSidebar(false);
-  const goToProfile = () => {
-    navigate('/client-profile', { state: { client } });
-    closeSidebar();
+  const handleLogout = async () => { await signOut(auth); navigate("/auth"); };
+  const handleBookNow = (provider) => navigate("/service-details", { state: { provider, client } });
+  const handleChatNow = async (provider) => {
+    if (!client || !provider) return;
+    const chatId = await getOrCreateChat(client, provider);
+    setChatUser({ ...provider, chatId });
+    setUnseenChats(prev => ({ ...prev, [chatId]: 0 }));
   };
+  const goToProfile = () => navigate("/client-profile");
 
   return (
     <div style={styles.page}>
       {/* Navbar */}
       <div style={styles.navbar}>
-        <div style={styles.navLeft} onClick={toggleSidebar}>
-          <img
-            src={client?.imageURL || 'https://dummyimage.com/40x40/cccccc/ffffff&text=No+Image'}
-            alt="Profile"
-            style={styles.profileImage}
-          />
-        </div>
-        <button style={styles.logoutButton} onClick={handleLogout}>Logout</button>
-      </div>
+  <div style={styles.navLeft} onClick={toggleSidebar}>
+    <span style={styles.navTitle}>Client Dashboard</span>
+  </div>
 
-      {/* Sidebar */}
-      {showSidebar && (
-        <div style={styles.sidebar}>
-          <div style={styles.sidebarHeader}>
-            <button onClick={closeSidebar} style={styles.closeButton}>❌</button>
-            <img
-              src={client?.imageURL || 'https://dummyimage.com/100x100/cccccc/ffffff&text=No+Image'}
-              alt="Profile"
-              style={styles.profileImageLarge}
-            />
-            <h3>{client?.name || 'Client'}</h3>
-            <p>{client?.email}</p>
-          </div>
-          <div style={styles.sidebarMenu}>
-            <button onClick={goToProfile}>👤 View/Edit Profile</button>
-            <button onClick={handleLogout}>🚪 Logout</button>
-          </div>
-        </div>
-      )}
+  <div style={styles.navRight}>
+    <div style={styles.clientProfileTop} onClick={goToProfile}>
+      {/* Removed <img> */}
+      <span style={styles.clientNameTop}>{client?.name}</span>
+    </div>
+    <button style={styles.logoutButton} onClick={handleLogout}>Logout</button>
+  </div>
+</div>
+
+{/* Sidebar */}
+{showSidebar && (
+  <div style={styles.sidebar}>
+    <div style={styles.sidebarHeader}>
+      <button onClick={toggleSidebar} style={styles.closeButton}>❌</button>
+      {/* Removed <img> */}
+      <h3>{client?.name}</h3>
+      <p>{client?.email}</p>
+    </div>
+  </div>
+)}
 
       {/* Welcome */}
       <div style={styles.nameContainer}>
-        <span style={styles.clientName}>
-          Welcome, {client?.name || 'Client'}
-        </span>
+        <span style={styles.clientName}>Welcome, {client?.name}</span>
       </div>
 
       {/* Providers */}
@@ -116,22 +140,30 @@ const ClientDashboard = () => {
         <div style={styles.cardContainer}>
           {providers.map(provider => {
             const isOnline = providerStatuses[provider.uid]?.online;
+            const chatId = [client?.uid, provider.uid].sort().join("_");
+            const unseen = unseenChats[chatId] || 0;
+
             return (
               <div key={provider.id} style={styles.card}>
-                <h4>{provider.serviceType}</h4>
+                <h4 style={styles.cardTitle}>{provider.serviceType}</h4>
                 <p><strong>Name:</strong> {provider.name}</p>
-                <p><strong>Location:</strong> {provider.location}</p>
-                <p><strong>Price:</strong> ₹{provider.price}</p>
-                <p><strong>Rating:</strong> ⭐ {provider.rating || 4.5}</p>
-                <p>
-                  <strong>Status:</strong>{" "}
-                  <span style={{ color: isOnline ? 'green' : 'red' }}>
-                    {isOnline ? '🟢 Online' : '🔴 Offline'}
+                <p><strong>Phone:</strong> {provider.phone || "N/A"}</p>
+                <p><strong>Price:</strong> ₹{provider.price || "N/A"}</p>
+                <p><strong>Status:</strong>
+                  <span style={{
+                    ...styles.statusBadge,
+                    backgroundColor: isOnline ? "#bbf7d0" : "#fecaca",
+                    color: isOnline ? "#166534" : "#991b1b"
+                  }}>
+                    {isOnline ? "🟢 Online" : "🔴 Offline"}
                   </span>
                 </p>
-                <button style={styles.bookButton} onClick={() => handleBookNow(provider)}>
-                  Book Now
-                </button>
+                <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
+                  <button style={styles.bookButton} onClick={() => handleBookNow(provider)}>Book Now</button>
+                  <button style={styles.chatButton} onClick={() => handleChatNow(provider)}>
+                    💬 Chat {unseen > 0 && <span style={styles.badge}>{unseen}</span>}
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -140,153 +172,52 @@ const ClientDashboard = () => {
         {/* Booking History */}
         <h3 style={styles.sectionTitle}>📖 Your Booking History</h3>
         <div style={styles.historyBox}>
-          {bookings.length === 0 ? (
-            <p>No bookings yet.</p>
-          ) : (
-            bookings.map((booking, index) => (
-              <div key={index} style={styles.historyItem}>
-                <p><strong>Service:</strong> {booking.serviceType}</p>
-                <p><strong>Provider:</strong> {booking.providerName}</p>
-                <p><strong>Status:</strong> {booking.status}</p>
-                <p><strong>Time:</strong> {booking.time}</p>
+          {bookings.length === 0 ? (<p>No bookings yet.</p>) : (
+            bookings.map((b, i) => (
+              <div key={i} style={styles.historyItem}>
+                <h4>{b.serviceType}</h4>
+                <p><strong>Provider:</strong> {b.providerName}</p>
+                <p><strong>Status:</strong> {b.status}</p>
               </div>
             ))
           )}
         </div>
       </div>
+
+      {/* Chat Modal */}
+      {chatUser && <ChatWindow chatId={chatUser.chatId} currentUser={client} otherUser={chatUser} onClose={() => setChatUser(null)} />}
     </div>
   );
 };
 
+// ===== Styles =====
 const styles = {
-  page: {
-    fontFamily: 'Poppins, sans-serif',
-    backgroundColor: '#f0f4f8',
-    minHeight: '100vh',
-  },
-  navbar: {
-    backgroundColor: '#2563eb',
-    color: 'white',
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: '10px 20px',
-    position: 'sticky',
-    top: 0,
-    zIndex: 100,
-  },
-  navLeft: {
-    display: 'flex',
-    alignItems: 'center',
-    cursor: 'pointer',
-  },
-  profileImage: {
-    width: '40px',
-    height: '40px',
-    borderRadius: '50%',
-  },
-  logoutButton: {
-    backgroundColor: '#dc2626',
-    color: '#fff',
-    border: 'none',
-    borderRadius: '6px',
-    padding: '8px 18px',
-    cursor: 'pointer',
-  },
-  sidebar: {
-    position: 'fixed',
-    top: 0,
-    left: 0,
-    width: '260px',
-    height: '100%',
-    backgroundColor: '#1e293b',
-    color: 'white',
-    zIndex: 1000,
-    padding: '24px',
-    boxShadow: '2px 0 10px rgba(0,0,0,0.3)',
-  },
-  sidebarHeader: {
-    textAlign: 'center',
-    marginBottom: '30px',
-    position: 'relative',
-  },
-  closeButton: {
-    position: 'absolute',
-    right: 0,
-    top: 0,
-    background: 'transparent',
-    border: 'none',
-    color: 'white',
-    fontSize: '20px',
-    cursor: 'pointer',
-  },
-  profileImageLarge: {
-    width: '100px',
-    height: '100px',
-    borderRadius: '50%',
-    marginBottom: '10px',
-  },
-  sidebarMenu: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '14px',
-  },
-  nameContainer: {
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    margin: '40px 0 20px',
-  },
-  clientName: {
-    fontSize: '40px',
-    fontWeight: '700',
-    color: '#1e293b',
-    letterSpacing: '0.5px',
-    textTransform: 'capitalize',
-    backgroundColor: '#e0f2fe',
-    padding: '12px 24px',
-    borderRadius: '12px',
-    boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-  },
-  content: {
-    padding: '30px',
-  },
-  sectionTitle: {
-    marginTop: '20px',
-    marginBottom: '20px',
-  },
-  cardContainer: {
-    display: 'flex',
-    flexWrap: 'wrap',
-    gap: '24px',
-  },
-  card: {
-    backgroundColor: '#ffffff',
-    borderRadius: '12px',
-    padding: '20px',
-    width: '280px',
-    boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-  },
-  bookButton: {
-    marginTop: '12px',
-    backgroundColor: '#2563eb',
-    color: 'white',
-    border: 'none',
-    padding: '10px 12px',
-    borderRadius: '8px',
-    cursor: 'pointer',
-  },
-  historyBox: {
-    marginTop: '30px',
-    backgroundColor: '#fff',
-    padding: '20px',
-    borderRadius: '10px',
-  },
-  historyItem: {
-    borderBottom: '1px solid #ccc',
-    marginBottom: '12px',
-    paddingBottom: '10px',
-  },
+  page: { fontFamily: "Poppins, sans-serif", backgroundColor: "#f8fafc", minHeight: "100vh", paddingBottom: "40px" },
+  navbar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 24px", background: "linear-gradient(90deg,#2563eb,#1e40af)", color: "#fff", position: "sticky", top: 0, zIndex: 100 },
+  navLeft: { display: "flex", alignItems: "center", gap: "12px", cursor: "pointer" },
+  navRight: { display: "flex", alignItems: "center", gap: "12px" },
+  navTitle: { fontSize: "20px", fontWeight: 600, color: "#fff" },
+  logoutButton: { backgroundColor: "#dc2626", color: "#fff", border: "none", borderRadius: "8px", padding: "8px 18px", cursor: "pointer" },
+  clientProfileTop: { display: "flex", alignItems: "center", gap: "6px", backgroundColor: "#e0f2fe", padding: "6px 10px", borderRadius: "12px", cursor: "pointer" },
+  clientImageTop: { width: "35px", height: "35px", borderRadius: "50%", border: "2px solid #38bdf8" },
+  clientNameTop: { fontSize: "14px", fontWeight: 600, color: "#1e293b" },
+  sidebar: { position: "fixed", top: 0, left: 0, width: "250px", height: "100%", backgroundColor: "#1e293b", color: "#fff", zIndex: 1000, padding: "28px", boxShadow: "4px 0 12px rgba(0,0,0,0.4)" },
+  sidebarHeader: { textAlign: "center", marginBottom: "30px", position: "relative" },
+  closeButton: { position: "absolute", right: 0, top: 0, background: "transparent", border: "none", color: "white", fontSize: "20px", cursor: "pointer" },
+  profileImageLarge: { width: "100px", height: "100px", borderRadius: "50%", marginBottom: "10px", border: "3px solid #38bdf8" },
+  nameContainer: { display: "flex", justifyContent: "center", margin: "40px 0 20px" },
+  clientName: { fontSize: "28px", fontWeight: "700", color: "#1e293b", backgroundColor: "#e0f2fe", padding: "12px 24px", borderRadius: "14px", boxShadow: "0 2px 10px rgba(0,0,0,0.15)" },
+  content: { padding: "20px" },
+  sectionTitle: { marginTop: "30px", marginBottom: "20px", fontSize: "22px", fontWeight: 600, color: "#334155" },
+  cardContainer: { display: "flex", flexWrap: "wrap", gap: "20px" },
+  card: { backgroundColor: "#fff", borderRadius: "12px", padding: "20px", width: "260px", boxShadow: "0 6px 16px rgba(0,0,0,0.08)", transition: "transform 0.2s ease, box-shadow 0.2s ease" },
+  cardTitle: { fontSize: "18px", fontWeight: 600, marginBottom: "10px", color: "#1e40af" },
+  statusBadge: { display: "inline-block", padding: "4px 10px", borderRadius: "20px", fontSize: "12px", fontWeight: 600 },
+  bookButton: { flex: 1, padding: "8px 12px", background: "linear-gradient(90deg,#2563eb,#1e40af)", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer", fontWeight: 600 },
+  chatButton: { flex: 1, padding: "8px 12px", background: "linear-gradient(90deg,#10b981,#047857)", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer", fontWeight: 600, position: "relative" },
+  badge: { position: "absolute", top: "-6px", right: "-6px", backgroundColor: "#ef4444", color: "#fff", borderRadius: "50%", padding: "2px 6px", fontSize: "12px" },
+  historyBox: { display: "flex", flexDirection: "column", gap: "12px" },
+  historyItem: { backgroundColor: "#fff", padding: "14px", borderRadius: "12px", boxShadow: "0 4px 12px rgba(0,0,0,0.06)" }
 };
 
 export default ClientDashboard;

@@ -24,7 +24,7 @@ const PaymentPage = () => {
         createdAt: Timestamp.now(),
       });
 
-      alert('Payment successful via fake card ✅');
+      alert('Payment successful  ✅');
       navigate('/client-dashboard');
     } catch (err) {
       console.error("Booking error:", err.message);
@@ -36,7 +36,7 @@ const PaymentPage = () => {
 
   return (
     <div style={styles.container}>
-      <h2>Fake Payment Gateway 💳</h2>
+      <h2> Payment Gateway 💳</h2>
       <p><strong>Welcome:</strong> {client.name}</p>
       <p><strong>Service:</strong> {provider.serviceType}</p>
       <p><strong>Price:</strong> ₹{provider.price}</p>

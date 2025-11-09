@@ -1,7 +1,7 @@
 // src/firebase.js
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
+import { getFirestore,serverTimestamp } from "firebase/firestore";
 import { getAnalytics } from "firebase/analytics";
 import { getStorage } from "firebase/storage"; // ✅ Add this
 import { getDatabase } from "firebase/database";
@@ -21,4 +21,6 @@ const db = getFirestore(app);
 const storage = getStorage(app); // ✅ Only define once
 const analytics = getAnalytics(app); // optional
 export const rtdb = getDatabase(app);
-export { app, auth, db, storage }; // ✅ Clean export
+export { app, auth, db, storage };
+ // ✅ Clean export
+export {serverTimestamp}
